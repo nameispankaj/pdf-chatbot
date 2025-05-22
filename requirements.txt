@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+PyPDF2
+markdown
+sentence-transformers
+scikit-learn
+numpy
+together
