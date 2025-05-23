@@ -1,7 +1,7 @@
 import os
 import glob
 import PyPDF2
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 import markdown as md
@@ -9,19 +9,30 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from together import Together
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import re
 
+# === CONFIG ===
 PDF_FOLDER = "pdfs"
 TOGETHER_API_KEY = "tgp_v1_DJjgagYOdwXci5KGKCJe2I0jGtmvvMGlYt-OBk1JSVc"
+EMBED_MODEL = 'all-MiniLM-L6-v2'
+LLM_MODEL = "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+MAX_TOKENS = 2048
+QA_SIM_THRESHOLD = 0.75
 
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+embedder = SentenceTransformer(EMBED_MODEL)
 client = Together(api_key=TOGETHER_API_KEY)
+executor = ThreadPoolExecutor(max_workers=4)  # Increase for more concurrency
 
+# --- Extract QA pairs with source reference ---
 def extract_qa_pairs_from_pdfs(pdf_folder):
     qa_pairs = []
     for pdf_file in glob.glob(os.path.join(pdf_folder, "*.pdf")):
+        pdf_filename = os.path.basename(pdf_file)
         with open(pdf_file, "rb") as f:
             reader = PyPDF2.PdfReader(f)
-            for page in reader.pages:
+            for page_num, page in enumerate(reader.pages):
                 text = page.extract_text()
                 if text:
                     lines = text.split('\n')
@@ -29,12 +40,10 @@ def extract_qa_pairs_from_pdfs(pdf_folder):
                     while i < len(lines):
                         if lines[i].strip().lower().startswith("q"):
                             q = lines[i].split(":", 1)[-1].strip() if ':' in lines[i] else lines[i].strip()
-                            # Find the 'A:' line
                             j = i + 1
                             while j < len(lines) and not lines[j].strip().lower().startswith("a"):
                                 j += 1
                             if j < len(lines):
-                                # Extract answer (multi-line)
                                 a = lines[j].split(":", 1)[-1].strip() if ':' in lines[j] else lines[j].strip()
                                 k = j + 1
                                 answer_lines = [a]
@@ -42,7 +51,12 @@ def extract_qa_pairs_from_pdfs(pdf_folder):
                                     answer_lines.append(lines[k].strip())
                                     k += 1
                                 full_answer = "\n".join([l for l in answer_lines if l])
-                                qa_pairs.append((q, full_answer))
+                                qa_pairs.append({
+                                    "q": q,
+                                    "a": full_answer,
+                                    "pdf": pdf_filename,
+                                    "page": page_num + 1
+                                })
                                 i = k
                             else:
                                 i += 1
@@ -50,35 +64,23 @@ def extract_qa_pairs_from_pdfs(pdf_folder):
                             i += 1
     return qa_pairs
 
-qa_pairs = extract_qa_pairs_from_pdfs(PDF_FOLDER)
-pdf_questions = [q for q, a in qa_pairs]
-pdf_answers = [a for q, a in qa_pairs]
-if pdf_questions:
-    pdf_q_embeddings = embedder.encode(pdf_questions)
-else:
-    pdf_q_embeddings = np.array([])
-
-def get_similar_pdf_answer(user_question, threshold=0.75):
-    if not pdf_questions:
-        return None, 0
-    user_emb = embedder.encode([user_question])
-    sims = cosine_similarity(user_emb, pdf_q_embeddings)[0]
-    max_idx = int(np.argmax(sims))
-    max_score = sims[max_idx]
-    if max_score > threshold:
-        return pdf_answers[max_idx], max_score
-    return None, float(max_score)
-
 def extract_text_from_pdfs(pdf_folder):
-    all_text = ""
+    all_text = []
     for pdf_file in glob.glob(os.path.join(pdf_folder, "*.pdf")):
         with open(pdf_file, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
                 page_text = page.extract_text()
                 if page_text:
-                    all_text += page_text + "\n"
-    return all_text
+                    all_text.append(page_text)
+    return "\n".join(all_text)
+
+qa_pairs = extract_qa_pairs_from_pdfs(PDF_FOLDER)
+pdf_questions = [qa["q"] for qa in qa_pairs]
+pdf_answers = [qa["a"] for qa in qa_pairs]
+pdf_sources = [(qa["pdf"], qa["page"]) for qa in qa_pairs]
+pdf_q_embeddings = embedder.encode(pdf_questions) if pdf_questions else np.array([])
+pdf_text = extract_text_from_pdfs(PDF_FOLDER)
 
 def make_system_prompt(pdf_text):
     return (
@@ -87,7 +89,29 @@ def make_system_prompt(pdf_text):
         "Otherwise, answer general questions as a knowledgeable chatbot."
     )
 
-pdf_text = extract_text_from_pdfs(PDF_FOLDER)
+def get_similar_pdf_answer(user_question, threshold=QA_SIM_THRESHOLD):
+    if not pdf_questions:
+        return None, 0, None
+    user_emb = embedder.encode([user_question])
+    sims = cosine_similarity(user_emb, pdf_q_embeddings)[0]
+    max_idx = int(np.argmax(sims))
+    max_score = sims[max_idx]
+    if max_score > threshold:
+        return pdf_answers[max_idx], max_score, max_idx
+    return None, float(max_score), None
+
+def paragraphify(text):
+    """
+    Converts text with excessive newlines into clean paragraphs.
+    Paragraphs are separated by two or more newlines, everything else is joined into one line.
+    """
+    paras = re.split(r'\n{2,}', text)
+    cleaned = []
+    for para in paras:
+        single_line = ' '.join(line.strip() for line in para.strip().split('\n') if line.strip())
+        if single_line:
+            cleaned.append(single_line)
+    return '<p>' + '</p><p>'.join(cleaned) + '</p>'
 
 app = FastAPI()
 
@@ -97,29 +121,116 @@ HTML_CHAT = """
 <head>
   <title>PDF Chatbot</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link href="https://fonts.googleapis.com/css?family=Inter:400,700&display=swap" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; background: #f4f4f4; }
-    #chatbox { width: 100%%; max-width: 700px; margin: 40px auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow:0 0 10px #bbb; }
-    #messages { min-height: 300px; max-height: 55vh; overflow-y: auto; margin-bottom: 16px; }
-    .bubble { margin: 12px 0; padding: 12px 18px; border-radius: 18px; max-width: 80%%; word-break: break-word; }
-    .user { background: #e0e6f7; align-self: flex-end; text-align: right; }
-    .bot { background: #eef; border-left: 4px solid #4e7; align-self: flex-start; }
-    #askform { display: flex; gap: 10px; }
-    #question { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #bbb; }
-    button { padding: 10px 24px; border-radius: 6px; border: none; background: #4e7; color: #fff; font-weight: bold; }
-    pre, code { background: #222; color: #eee; padding: 2px 4px; border-radius: 3px; }
-    ul, ol { padding-left: 20px; }
+    body {
+      font-family: 'Inter', Arial, sans-serif;
+      background: linear-gradient(120deg, #e7f0fd 0%%, #f5f7fa 100%%);
+      color: #212c33;
+      margin: 0;
+      min-height: 100vh;
+    }
+    #chatbox {
+      width: 100%%;
+      max-width: 740px;
+      margin: 42px auto 0 auto;
+      background: #fff;
+      padding: 28px 28px 15px 28px;
+      border-radius: 18px;
+      box-shadow: 0 8px 40px #b0b6c844;
+    }
+    #messages {
+      min-height: 320px; max-height: 59vh;
+      overflow-y: auto; margin-bottom: 25px;
+      display: flex; flex-direction: column;
+      gap: 8px;
+    }
+    .bubble {
+      margin: 0;
+      padding: 13px 22px;
+      border-radius: 18px;
+      max-width: 87%%;
+      word-break: break-word;
+      font-size: 1.12em;
+      line-height: 1.68;
+      box-shadow: 0 3px 14px #e3e8f367;
+      transition: background .22s;
+    }
+    .user {
+      background: #e5e9f8;
+      align-self: flex-end; text-align: right;
+      color: #315e8a; font-weight: 600;
+      border-bottom-right-radius: 8px;
+    }
+    .bot {
+      background: #f8fafc;
+      border-left: 4px solid #7fc97f;
+      align-self: flex-start;
+      color: #184c20;
+      border-bottom-left-radius: 8px;
+    }
+    .bot.loading {
+      font-style: italic; color: #888; background: #f7f8fa;
+      border-left: 4px solid #bbb;
+    }
+    .justify { text-align: justify; }
+    #askform {
+      display: flex; gap: 11px; margin-bottom: 0;
+    }
+    #question {
+      flex: 1; padding: 15px; border-radius: 7px;
+      border: 1.5px solid #bdd3e6;
+      font-size: 1em; background: #f8fafc;
+      transition: border-color .22s;
+    }
+    #question:focus { outline: none; border-color: #7fc97f; }
+    button {
+      padding: 14px 32px;
+      border-radius: 7px; border: none;
+      background: linear-gradient(90deg, #7fc97f, #4e7);
+      color: #fff; font-weight: 700; font-size: 1em;
+      cursor: pointer; box-shadow: 0 2px 7px #c7dfcd4d;
+      transition: background .18s;
+    }
+    button:active { background: #4e7; }
+    pre, code {
+      background: #23272e; color: #eee;
+      padding: 2px 7px; border-radius: 4px;
+      font-size: 0.98em;
+    }
+    ul, ol { padding-left: 27px; }
+    .spinner {
+      display: inline-block; width: 18px; height: 18px;
+      border: 3px solid #e6e6e6;
+      border-top: 3px solid #7fc97f;
+      border-radius: 50%%; animation: spin 1s linear infinite;
+      margin-right: 8px; vertical-align: middle;
+    }
+    @keyframes spin {
+      0%% { transform: rotate(0deg); }
+      100%% { transform: rotate(360deg); }
+    }
     @media (max-width: 600px) {
       #chatbox { padding: 8px; }
-      #question { padding: 8px; }
-      button { padding: 8px 16px; }
+      #question { padding: 11px; }
+      button { padding: 11px 14px; font-size: 0.97em;}
+    }
+    /* Enhance PDF answer appearance */
+    .pdf-ref {
+      margin-top:2em;
+      font-size:0.97em;
+      color:#888;
+      text-align: left;
+    }
+    .justify p {
+      margin-block: 0.65em 0.65em;
     }
   </style>
 </head>
 <body>
   <div id="chatbox">
-    <h2 style="text-align:center;">PDF Chatbot</h2>
-    <div id="messages" style="display: flex; flex-direction: column;"></div>
+    <h2 style="text-align:center; margin-bottom:20px; color:#3e6f44;">PDF Chatbot</h2>
+    <div id="messages"></div>
     <form id="askform" autocomplete="off">
       <input type="text" id="question" placeholder="Type your message..." required autocomplete="off" />
       <button type="submit">Send</button>
@@ -135,9 +246,9 @@ HTML_CHAT = """
       messagesDiv.innerHTML = '';
       for (const msg of history) {
         const div = document.createElement('div');
-        div.className = 'bubble ' + (msg.role === 'user' ? 'user' : 'bot');
+        div.className = 'bubble ' + (msg.role === 'user' ? 'user' : (msg.loading ? 'bot loading' : 'bot'));
         if (msg.role === 'bot') {
-          div.innerHTML = msg.html || '<i>...</i>';
+          div.innerHTML = msg.html || '<span class="spinner"></span> <i>Thinking...</i>';
         } else {
           div.textContent = msg.content;
         }
@@ -153,7 +264,7 @@ HTML_CHAT = """
       history.push({ role: 'user', content: question });
       renderMessages();
       questionInput.value = '';
-      history.push({ role: 'bot', html: '<i>Thinking...</i>' });
+      history.push({ role: 'bot', loading: true, html: null });
       renderMessages();
       const res = await fetch('/chat', {
         method: 'POST',
@@ -161,7 +272,7 @@ HTML_CHAT = """
         body: JSON.stringify({ question })
       });
       const data = await res.json();
-      history.pop(); // remove 'Thinking...'
+      history.pop(); // remove loading
       history.push({ role: 'bot', html: data.html_answer || "<b>Answer:</b><br>" + (data.answer || data.detail || "No response.") });
       renderMessages();
     };
@@ -171,43 +282,60 @@ HTML_CHAT = """
 """
 
 @app.get("/", response_class=HTMLResponse)
-def root():
+async def root():
     return HTML_CHAT
 
+def llm_query(system_prompt, user_input):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input}
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            stream=True,
+            max_tokens=MAX_TOKENS
+        )
+        answer_pieces = []
+        for token in response:
+            if hasattr(token, 'choices') and token.choices:
+                delta = getattr(token.choices[0], 'delta', None)
+                if delta and hasattr(delta, 'content') and delta.content:
+                    answer_pieces.append(delta.content)
+        answer = ''.join(answer_pieces).strip()
+        if not answer:
+            answer = "No response."
+        # Hide specific rate limit error
+        if "rate limit" in answer.lower():
+            return "Sorry, I'm currently handling a lot of requests. Please try again in a moment."
+        return answer
+    except Exception as e:
+        if "rate limit" in str(e).lower():
+            return "Sorry, I'm currently handling a lot of requests. Please try again in a moment."
+        return "Sorry, there was an issue processing your request. Please try again later."
+
 @app.post("/chat")
-async def chat(request: Request):
+async def chat(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
-    user_input = data.get("question")
-    pdf_answer, sim = get_similar_pdf_answer(user_input)
+    user_input = data.get("question", "")
+    pdf_answer, sim, pdf_idx = get_similar_pdf_answer(user_input)
     if pdf_answer:
-        answer = pdf_answer
+        pdf_file, pdf_page = pdf_sources[pdf_idx]
+        ref_html = f'<div class="pdf-ref">Reference: <b>{pdf_file}</b>, page {pdf_page}</div>'
+        html_answer = f'<div class="justify">{paragraphify(pdf_answer)}<br><br>{ref_html}</div>'
+        answer = pdf_answer + "\n\n\nReference: {} (page {})".format(pdf_file, pdf_page)
     else:
-        # Use LLM for generic/basic questions not covered in PDF
-        messages = [
-            {"role": "system", "content": make_system_prompt(pdf_text)},
-            {"role": "user", "content": user_input}
-        ]
-        try:
-            response = client.chat.completions.create(
-                model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-                messages=messages,
-                stream=True,
-                max_tokens=2048
-            )
-            answer_pieces = []
-            for token in response:
-                if hasattr(token, 'choices') and token.choices:
-                    delta = getattr(token.choices[0], 'delta', None)
-                    if delta and hasattr(delta, 'content') and delta.content:
-                        answer_pieces.append(delta.content)
-            answer = ''.join(answer_pieces).strip()
-            if not answer:
-                answer = "No response."
-        except Exception as e:
-            answer = f"Error: {str(e)}"
-    html_answer = md.markdown(answer, extensions=['fenced_code', 'tables', 'nl2br'])
+        loop = asyncio.get_event_loop()
+        answer = await loop.run_in_executor(
+            executor,
+            llm_query,
+            make_system_prompt(pdf_text),
+            user_input
+        )
+        html_answer = md.markdown(answer, extensions=['fenced_code', 'tables', 'nl2br'])
     return JSONResponse({"answer": answer, "html_answer": html_answer})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    # For production, use: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
     uvicorn.run(app, host="0.0.0.0", port=8000)
